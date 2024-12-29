@@ -1,0 +1,25 @@
+[package]
+name = "sklep-fuse"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0" }
+thiserror = { version = "2.0" }
+
+# system
+fuser = { version = "0.15.1" }
+nix = { version = "0.29.0" }
+
+# filesystem
+rej = { version = "0.10", features = ["cipher"] }
+seahash = { version = "4.1" }
+
+# crypto
+zeroize = { version = "1.8" }
+getrandom = { version = "0.2.15" }
+
+# log
+syslog = { version = "7.0" }
+env_logger = { version = "0.11.6" }
+log = { version = "0.4.22" }

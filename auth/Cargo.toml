@@ -1,0 +1,14 @@
+[package]
+name = "sklep-auth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "sklep"
+
+[dependencies]
+pam-sys = { version = "1.0.0-alpha5" }
+nix = { version = "0.29.0", features = ["process"] }
+anyhow = { version = "1.0" }
+zeroize = { version = "1.8" }
