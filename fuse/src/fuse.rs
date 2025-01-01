@@ -5,49 +5,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
+use fuser::{FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use zeroize::Zeroize;
 use nix::errno::Errno;
 
-use super::schema;
+use super::{
+    schema,
+    plain::{PlainData, Attributes, DirectoryEntry},
+};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
-
-const TEMPLATE_DIR_ATTR: FileAttr = FileAttr {
-    ino: 0,
-    size: 0,
-    blocks: 0,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::Directory,
-    perm: 0o755,
-    nlink: 2,
-    uid: 0,
-    gid: 0,
-    rdev: 0,
-    flags: 0,
-    blksize: 0x1000,
-};
-
-const TEMPLATE_FILE_ATTR: FileAttr = FileAttr {
-    ino: 0,
-    size: 0,
-    blocks: 1,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::RegularFile,
-    perm: 0o644,
-    nlink: 1,
-    uid: 0,
-    gid: 0,
-    rdev: 0,
-    flags: 0,
-    blksize: 0x1000,
-};
 
 fn unwrap_time(v: fuser::TimeOrNow) -> SystemTime {
     match v {
@@ -106,20 +73,54 @@ impl SklepFs {
     }
 
     fn populate(&self) -> Result<(), schema::SchemaError> {
-        schema::insert_ino(&self.db, self.seed, 1, 1, OsStr::new("."), false)?;
-        schema::insert_ino(&self.db, self.seed, 1, 1, OsStr::new(".."), false)?;
-        let mut attr = TEMPLATE_DIR_ATTR;
-        attr.ino = 1;
-        attr.uid = 1000;
-        attr.gid = 1000;
+        let attr = Attributes::new(FileType::Directory, false, false).inc_link();
         schema::insert_attr(&self.db, 1, &attr)?;
+        let entry = DirectoryEntry::from_attr(1, &attr, OsStr::new("."));
+        schema::insert_dir_entry(&self.db, self.seed, 1, entry, false)?;
+        let entry = DirectoryEntry::from_attr(1, &attr, OsStr::new(".."));
+        schema::insert_dir_entry(&self.db, self.seed, 1, entry, false)?;
 
         Ok(())
     }
 
-    fn check(&self) -> Result<(), rej::DbError> {
+    fn check(&self) -> Result<(), schema::SchemaError> {
         log::info!("check...");
-        // TODO: versioning, migration
+
+        let mut it = self.db.entry(schema::INODE_TABLE_ID, &[]).into_db_iter();
+        while let Some((schema::INODE_TABLE_ID, k, v)) = self.db.next(&mut it) {
+            let (dir_entry, rewrite) = DirectoryEntry::recognize(&v)?;
+            if rewrite {
+                log::warn!("fix directory entry {dir_entry}");
+                if let Err(err) = self
+                    .db
+                    .entry(schema::INODE_TABLE_ID, &k)
+                    .occupied()
+                    .expect("just checked")
+                    .into_value()
+                    .rewrite(dir_entry.as_bytes())
+                {
+                    log::error!("error during fix: {err}");
+                }
+            }
+        }
+
+        let mut it = self.db.entry(schema::ATTR_TABLE_ID, &[]).into_db_iter();
+        while let Some((schema::ATTR_TABLE_ID, k, v)) = self.db.next(&mut it) {
+            let (attr, rewrite) = Attributes::recognize(&v)?;
+            if rewrite {
+                log::warn!("fix attributes {attr}");
+            }
+            if let Err(err) = self
+                .db
+                .entry(schema::ATTR_TABLE_ID, &k)
+                .occupied()
+                .expect("just checked")
+                .into_value()
+                .rewrite(attr.as_bytes())
+            {
+                log::error!("error during fix: {err}");
+            }
+        }
 
         Ok(())
     }
@@ -127,81 +128,99 @@ impl SklepFs {
 
 impl Filesystem for SklepFs {
     fn lookup(&mut self, _req: &Request, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
-        let Some(ino) = schema::lookup_ino(&self.db, self.seed, parent_ino, name) else {
-            reply.error(Errno::ENOENT as _);
-            return;
+        let ino = match schema::lookup_dir(&self.db, self.seed, parent_ino, name) {
+            Err(err) => {
+                log::error!("lookup dir, name={}, error {err}", name.to_string_lossy());
+                reply.error(Errno::EIO as _);
+                return;
+            }
+            Ok(None) => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Ok(Some(v)) => v,
         };
-        let Some(attr) = schema::retrieve_attr(&self.db, ino) else {
-            reply.error(Errno::ENOENT as _);
-            return;
+        let attr = match schema::retrieve_attr(&self.db, ino) {
+            Err(err) => {
+                log::error!("lookup attr ino={ino}, error: {err}");
+                reply.error(Errno::EIO as _);
+                return;
+            }
+            Ok(None) => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Ok(Some(v)) => v,
         };
-        reply.entry(&TTL, &attr, 0);
+        reply.entry(&TTL, &attr.posix_attr(1000, ino), 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let Some(attr) = schema::retrieve_attr(&self.db, ino) else {
-            reply.error(Errno::ENOENT as _);
-            return;
-        };
-        reply.attr(&TTL, &attr);
+        match schema::retrieve_attr(&self.db, ino) {
+            Err(err) => {
+                log::error!("lookup attr ino={ino}, error: {err}");
+                reply.error(Errno::EIO as _);
+            }
+            Ok(None) => {
+                reply.error(Errno::ENOENT as _);
+            }
+            Ok(Some(attr)) => reply.attr(&TTL, &attr.posix_attr(1000, ino)),
+        }
     }
 
     fn setattr(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<fuser::TimeOrNow>,
+        _atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
-        ctime: Option<std::time::SystemTime>,
+        _ctime: Option<std::time::SystemTime>,
         _fh: Option<u64>,
         crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        flags: Option<u32>,
+        _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let Some(mut attr) = schema::retrieve_attr(&self.db, ino) else {
-            reply.error(Errno::ENOENT as _);
-            return;
+        let mut attr = match schema::retrieve_attr(&self.db, ino) {
+            Err(err) => {
+                log::error!("lookup attr ino={ino}, error: {err}");
+                reply.error(Errno::EIO as _);
+                return;
+            }
+            Ok(None) => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Ok(Some(v)) => v,
         };
-        if let Some(mode) = mode {
-            attr.perm = mode as u16;
-            // TODO:?
-        }
-        if let Some(v) = uid {
-            attr.uid = v;
-        }
-        if let Some(v) = gid {
-            attr.gid = v;
-        }
         if let Some(v) = size {
             attr.size = v;
         }
-        if let Some(v) = atime {
-            attr.atime = unwrap_time(v);
-        }
         if let Some(v) = mtime {
-            attr.mtime = unwrap_time(v);
-        }
-        if let Some(v) = ctime {
-            attr.ctime = v;
+            attr.mtime_sec = unwrap_time(v)
+                .duration_since(UNIX_EPOCH)
+                .as_ref()
+                .map(Duration::as_secs)
+                .unwrap_or_default();
         }
         if let Some(v) = crtime {
-            attr.crtime = v;
-        }
-        if let Some(v) = flags {
-            attr.flags = v;
+            attr.crtime_sec = v
+                .duration_since(UNIX_EPOCH)
+                .as_ref()
+                .map(Duration::as_secs)
+                .unwrap_or_default();
         }
         if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
             log::error!("{err}");
             reply.error(Errno::EIO as _);
             return;
         }
-        reply.attr(&TTL, &attr);
+        reply.attr(&TTL, &attr.posix_attr(1000, ino));
     }
 
     fn read(
@@ -232,7 +251,7 @@ impl Filesystem for SklepFs {
             reply.data(&[]);
             return;
         }
-        let size = (offset + (size as usize)).min(value.length()) - offset;
+        let size = (offset + size).min(value.length()) - offset;
         let mut data = vec![0; size];
         value.read(offset, &mut data);
         reply.data(&data);
@@ -257,7 +276,7 @@ impl Filesystem for SklepFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let mut it = schema::iter_ino(&self.db, parent_ino);
+        let mut it = schema::iter_dir(&self.db, parent_ino);
         let mut this_offset = 0;
         loop {
             match schema::next_ino(&self.db, parent_ino, &mut it) {
@@ -270,11 +289,7 @@ impl Filesystem for SklepFs {
                 Ok(Some(value)) => {
                     let ino = value.ino();
                     let fty = value.fty();
-                    let Some(name) = value.name() else {
-                        log::error!("{}", schema::SchemaError::LongFilename);
-                        reply.error(Errno::EIO as _);
-                        return;
-                    };
+                    let name = value.name();
                     if this_offset >= offset && reply.add(ino, this_offset + 1, fty, name) {
                         break;
                     }
@@ -291,28 +306,30 @@ impl Filesystem for SklepFs {
         _req: &Request<'_>,
         parent_ino: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        // TODO: 3?
-        let ino = 3u64;
-        if let Err(err) = schema::insert_ino(&self.db, self.seed, parent_ino, ino, name, false) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-        let mut attr = TEMPLATE_FILE_ATTR;
-        attr.ino = ino;
-        attr.uid = 1000;
-        attr.gid = 1000;
+        let ro = mode & 0o200 == 0;
+        let ex = mode & 0o100 != 0;
+        let attr = Attributes::new(FileType::RegularFile, ro, ex).inc_link();
+        // TODO: 2?
+        let ino = 2u64;
+        // should return inode number (ino)
         if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
             log::error!("{err}");
             reply.error(Errno::EIO as _);
             return;
         }
 
-        reply.created(&TTL, &attr, 0, 0, 0);
+        let entry = DirectoryEntry::from_attr(ino, &attr, name);
+        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false) {
+            log::error!("{err}");
+            reply.error(Errno::EIO as _);
+            return;
+        }
+
+        reply.created(&TTL, &attr.posix_attr(1000, ino), 0, 0, 0);
     }
 }
