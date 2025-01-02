@@ -25,7 +25,7 @@ pub enum SchemaError {
 
 pub fn init_seed(db: &Db, seed: &mut [u8]) -> Result<[u64; 4], DbError> {
     match db.entry(SPECIAL_TABLE_ID, &[]) {
-        Entry::Vacant(e) => e.insert()?.rewrite(&*seed)?,
+        Entry::Vacant(e) => db.rewrite(e.insert()?, &*seed)?,
         Entry::Occupied(e) => e.into_value().read(0, seed),
     }
     let mut it = seed
@@ -67,8 +67,8 @@ pub fn insert_dir_entry(
 ) -> Result<(), SchemaError> {
     let key = DirEntryKey::new(seed, parent_ino, entry.name());
     match db.entry(INODE_TABLE_ID, &key.raw) {
-        Entry::Vacant(e) => e.insert()?.rewrite(entry.as_bytes())?,
-        Entry::Occupied(e) if rewrite => e.into_value().rewrite(entry.as_bytes())?,
+        Entry::Vacant(e) => db.rewrite(e.insert()?, entry.as_bytes())?,
+        Entry::Occupied(e) if rewrite => db.rewrite(e.into_value(), entry.as_bytes())?,
         Entry::Occupied(_) => return Err(SchemaError::HashCollision),
     }
 
@@ -114,18 +114,17 @@ pub fn next_ino(
         return Ok(None);
     }
 
-    Ok(Some(DirectoryEntry::recognize(&value)?.0))
+    Ok(Some(DirectoryEntry::recognize(&value.read_to_vec())?.0))
 }
 
 pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> {
     let ino_bytes = ino.to_le_bytes();
     let entry = db.entry(ATTR_TABLE_ID, &ino_bytes);
-    let mut value = match entry {
+    let value = match entry {
         Entry::Occupied(e) => e.into_value(),
         Entry::Vacant(e) => e.insert()?,
     };
-
-    value.rewrite(attr.as_bytes())?;
+    db.rewrite(value, attr.as_bytes())?;
 
     Ok(())
 }

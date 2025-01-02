@@ -44,8 +44,8 @@ fn main() {
     let session = Arc::new(Mutex::new(None));
 
     let uid = unsafe { nix::libc::getuid() };
-    let path = PathBuf::from(format!("/var/run/user/{uid}/sklep.sock"));
-    match UnixListener::bind(path) {
+    let path = move || PathBuf::from(format!("/var/run/user/{uid}/sklep.sock"));
+    match UnixListener::bind(path()) {
         Ok(listener) => {
             for mut stream in listener.incoming().flatten() {
                 log::debug!("New stream");
@@ -64,9 +64,13 @@ fn main() {
                         '+' => {
                             stream.read_exact(&mut buffer).unwrap();
                             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                                match new_session(&mut stream, &mut buffer) {
+                                match new_session(&mut stream, &mut buffer, uid) {
                                     Ok(new) => *session.lock().expect("poisoned") = Some(new),
-                                    Err(err) => log::error!("{err}"),
+                                    Err(err) => {
+                                        log::error!("{err}");
+                                        fs::remove_file(path()).unwrap_or_default();
+                                        process::exit(0);
+                                    }
                                 }
                             } else {
                                 // TODO: validate
@@ -77,8 +81,7 @@ fn main() {
                         '-' => {
                             if counter.fetch_sub(1, Ordering::SeqCst) == 1 {
                                 *session.lock().expect("poisoned") = None;
-                                let path = PathBuf::from(format!("/var/run/user/{uid}/sklep.sock"));
-                                fs::remove_file(path).unwrap_or_default();
+                                fs::remove_file(path()).unwrap_or_default();
                                 process::exit(0);
                             }
                         }
@@ -96,6 +99,7 @@ fn main() {
 fn new_session(
     stream: &mut UnixStream,
     buffer: &mut [u8; 0x100],
+    uid: u32,
 ) -> anyhow::Result<BackgroundSession> {
     let len = buffer
         .iter()
@@ -140,7 +144,7 @@ fn new_session(
     };
 
     let path = PathBuf::from(".sklep.db");
-    let filesystem = match SklepFs::new(passphrase, time, memory, path) {
+    let filesystem = match SklepFs::new(passphrase, time, memory, path, uid) {
         Ok(v) => v,
         Err(err) => {
             buffer.zeroize();
