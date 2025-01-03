@@ -34,11 +34,11 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum StParseError {
-    #[error("too short: {0}")]
-    TooShort(usize),
+pub enum RecognizeError {
     #[error("bad file type: {0}")]
     FileType(u16),
+    #[error("unrecognized")]
+    Unrecognized,
 }
 
 #[repr(C)]
@@ -103,7 +103,7 @@ impl Attributes {
     pub const MAGIC: NonZeroU64 =
         unsafe { NonZeroU64::new_unchecked(u64::from_be_bytes(*b"sklep_tr")) };
 
-    fn from_older(raw: &[u8]) -> Result<Self, StParseError> {
+    fn from_older(raw: &[u8]) -> Result<Self, RecognizeError> {
         // migration, create self from previous version
         // currently no older versions exist
         let _ = raw;
@@ -112,61 +112,21 @@ impl Attributes {
 
     /// Try to recognize the self from raw data
     /// The `bool` means that need to rewrite the self on the storage
-    pub fn recognize(raw: &[u8]) -> Result<(Self, bool), StParseError> {
-        use std::time::{SystemTime, Duration, UNIX_EPOCH};
-
-        let sh = || StParseError::TooShort(raw.len());
-
-        let magic = u64::from_le_bytes(raw[..8].try_into().map_err(|_| sh())?);
+    pub fn recognize(raw: &[u8]) -> Result<(Self, bool), RecognizeError> {
+        let magic = u64::from_le_bytes(raw[..8].try_into().expect("must be big enough"));
+        let magic_old = u64::from_le_bytes(raw[12..20].try_into().expect("must be big enough"));
 
         if magic == Self::MAGIC.get() {
-            let version = u16::from_le_bytes(raw[8..10].try_into().map_err(|_| sh())?);
+            let version = u16::from_le_bytes(raw[8..10].try_into().expect("must be big enough"));
             if version < Self::VERSION {
                 Self::from_older(raw).map(|s| (s, true))
-            } else if raw.len() >= mem::size_of::<Self>() {
-                Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             } else {
-                Err(sh())
+                Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             }
-        } else if raw.len() == 0x70 {
-            // old posix
-
-            fn cut<const N: usize>(by: &mut &[u8]) -> [u8; N] {
-                let (x, rest) = unsafe { by.split_first_chunk().unwrap_unchecked() };
-                *by = rest;
-                *x
-            }
-
-            fn cut_time(by: &mut &[u8]) -> SystemTime {
-                UNIX_EPOCH
-                    + Duration::from_secs(u64::from_le_bytes(cut(by)))
-                    + Duration::from_nanos(u32::from_le_bytes(cut(by)) as u64)
-            }
-
-            let mut by = raw;
-            let posix = FileAttr {
-                ino: u64::from_le_bytes(cut(&mut by)),
-                size: u64::from_le_bytes(cut(&mut by)),
-                blocks: u64::from_le_bytes(cut(&mut by)),
-                atime: cut_time(&mut by),
-                mtime: cut_time(&mut by),
-                ctime: cut_time(&mut by),
-                crtime: cut_time(&mut by),
-                kind: {
-                    let c = u16::from_le_bytes(cut(&mut by));
-                    u16_to_fty(c).ok_or(StParseError::FileType(c))?.0
-                },
-                perm: u16::from_le_bytes(cut(&mut by)),
-                nlink: u32::from_le_bytes(cut(&mut by)),
-                uid: u32::from_le_bytes(cut(&mut by)),
-                gid: u32::from_le_bytes(cut(&mut by)),
-                rdev: u32::from_le_bytes(cut(&mut by)),
-                blksize: u32::from_le_bytes(cut(&mut by)),
-                flags: u32::from_le_bytes(cut(&mut by)),
-            };
-            Ok((posix.into(), true))
+        } else if magic_old == Self::MAGIC.get() {
+            Ok((*Self::as_this(&raw[12..][..mem::size_of::<Self>()]), true))
         } else {
-            Err(sh())
+            Err(RecognizeError::Unrecognized)
         }
     }
 
@@ -286,7 +246,7 @@ impl DirectoryEntry {
     pub const MAGIC: NonZeroU64 =
         unsafe { NonZeroU64::new_unchecked(u64::from_be_bytes(*b"sklep_dd")) };
 
-    fn from_older(raw: &[u8]) -> Result<Self, StParseError> {
+    fn from_older(raw: &[u8]) -> Result<Self, RecognizeError> {
         // migration, create self from previous version
         // currently no older versions exist
         let _ = raw;
@@ -295,38 +255,21 @@ impl DirectoryEntry {
 
     /// Try to recognize the self from raw data
     /// The `bool` means that need to rewrite the self on the storage
-    pub fn recognize(raw: &[u8]) -> Result<(Self, bool), StParseError> {
-        let sh = || StParseError::TooShort(raw.len());
-        let magic = u64::from_le_bytes(raw[..8].try_into().map_err(|_| sh())?);
+    pub fn recognize(raw: &[u8]) -> Result<(Self, bool), RecognizeError> {
+        let magic = u64::from_le_bytes(raw[..8].try_into().expect("must be big enough"));
+        let magic_old = u64::from_le_bytes(raw[12..20].try_into().expect("must be big enough"));
 
         if magic == Self::MAGIC.get() {
-            let version = u16::from_le_bytes(raw[8..10].try_into().map_err(|_| sh())?);
+            let version = u16::from_le_bytes(raw[8..10].try_into().expect("must be big enough"));
             if version < Self::VERSION {
                 Self::from_older(raw).map(|s| (s, true))
-            } else if raw.len() >= mem::size_of::<Self>() {
-                Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             } else {
-                Err(sh())
+                Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             }
-        } else if raw.len() == 0x100 {
-            let (fty, ro, ex) =
-                u16_to_fty(raw[0xff] as u16).ok_or(StParseError::FileType(raw[0xff] as u16))?;
-            let filename_size = raw[8] as usize;
-            let mut s = DirectoryEntry {
-                magic: Some(Self::MAGIC),
-                version: Self::VERSION,
-                fty: Some(fty_to_u16(fty, ro, ex)),
-                filename_size: filename_size as u16,
-                _hole: 0,
-                ino: u64::from_le_bytes(raw[..8].try_into().expect("just checked")),
-                _reserved: [0; 13],
-                filename: [0; MAX_FILENAME_SIZE],
-            };
-            s.filename[..filename_size].clone_from_slice(&raw[9..][..filename_size]);
-
-            Ok((s, true))
+        } else if magic_old == Self::MAGIC.get() {
+            Ok((*Self::as_this(&raw[12..][..mem::size_of::<Self>()]), true))
         } else {
-            Err(sh())
+            Err(RecognizeError::Unrecognized)
         }
     }
 

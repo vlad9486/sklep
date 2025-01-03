@@ -19,7 +19,7 @@ use super::{
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
 // ino -> data
-const DATA_TABLE_ID: u32 = 10;
+const DATA_TABLE_OBSOLETE_ID: u32 = 10;
 
 pub struct SklepFs {
     db: rej::Db,
@@ -82,10 +82,10 @@ impl SklepFs {
 
         let mut it = self.db.entry(schema::INODE_TABLE_ID, &[]).into_db_iter();
         while let Some((schema::INODE_TABLE_ID, _, v)) = self.db.next(&mut it) {
-            let (dir_entry, rewrite) = DirectoryEntry::recognize(&v.read_to_vec())?;
+            let (dir_entry, rewrite) = DirectoryEntry::recognize(&v.read_to_vec(true, 0, 0x1000))?;
             if rewrite {
                 log::warn!("fix directory entry {dir_entry}");
-                if let Err(err) = self.db.rewrite(v, dir_entry.as_bytes()) {
+                if let Err(err) = self.db.write_at(v, true, 0, dir_entry.as_bytes()) {
                     log::error!("error during fix: {err}");
                 }
             }
@@ -93,12 +93,28 @@ impl SklepFs {
 
         let mut it = self.db.entry(schema::ATTR_TABLE_ID, &[]).into_db_iter();
         while let Some((schema::ATTR_TABLE_ID, _, v)) = self.db.next(&mut it) {
-            let (attr, rewrite) = Attributes::recognize(&v.read_to_vec())?;
+            let (attr, rewrite) = Attributes::recognize(&v.read_to_vec(true, 0, 0x1000))?;
             if rewrite {
                 log::warn!("fix attributes {attr}");
             }
-            if let Err(err) = self.db.rewrite(v, attr.as_bytes()) {
+            if let Err(err) = self.db.write_at(v, true, 0, attr.as_bytes()) {
                 log::error!("error during fix: {err}");
+            }
+        }
+
+        let mut it = self.db.entry(DATA_TABLE_OBSOLETE_ID, &[]).into_db_iter();
+        let mut keys = vec![];
+        while let Some((DATA_TABLE_OBSOLETE_ID, key, _)) = self.db.next(&mut it) {
+            keys.push(key);
+        }
+        for key in keys {
+            if let rej::Entry::Occupied(entry) = self.db.entry(DATA_TABLE_OBSOLETE_ID, &key) {
+                log::warn!("remove obsolete {key:x?}");
+                if let Err(err) = entry.remove() {
+                    log::error!("error removing value from the db {err}");
+                }
+            } else {
+                log::warn!("unexpected missing {key:x?}");
             }
         }
 
@@ -222,7 +238,7 @@ impl Filesystem for SklepFs {
         reply: ReplyData,
     ) {
         let key = ino.to_le_bytes();
-        let Some(entry) = self.db.entry(DATA_TABLE_ID, &key).occupied() else {
+        let Some(entry) = self.db.entry(schema::ATTR_TABLE_ID, &key).occupied() else {
             reply.error(Errno::ENOENT as _);
             return;
         };
@@ -234,58 +250,63 @@ impl Filesystem for SklepFs {
         }
         let offset = offset as usize;
         let size = size as usize;
-        if offset > value.length() {
-            reply.data(&[]);
-            return;
-        }
-        let size = (offset + size).min(value.length()) - offset;
+
+        let size = 6; // 6?
         let mut data = vec![0; size];
-        value.read(offset, &mut data);
+        // if offset > value.length() {
+        //     reply.data(&[]);
+        //     return;
+        // }
+        // let size = (offset + size).min(value.length()) - offset;
+        // value.read(offset, &mut data);
+
+        // TODO: big value
+        value.read(true, 0x100 + offset, &mut data);
         reply.data(&data);
     }
 
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        let key = ino.to_le_bytes();
-        let value = match self.db.entry(DATA_TABLE_ID, &key) {
-            rej::Entry::Occupied(e) => e.into_value(),
-            rej::Entry::Vacant(e) => match e.insert() {
-                Ok(v) => v,
-                Err(err) => {
-                    log::error!("write ino={ino}, offset={offset}, error: {err}");
-                    reply.error(Errno::EIO as _);
-                    return;
-                }
-            },
-        };
+    // fn write(
+    //     &mut self,
+    //     _req: &Request<'_>,
+    //     ino: u64,
+    //     _fh: u64,
+    //     offset: i64,
+    //     data: &[u8],
+    //     _write_flags: u32,
+    //     _flags: i32,
+    //     _lock_owner: Option<u64>,
+    //     reply: ReplyWrite,
+    // ) {
+    //     let key = ino.to_le_bytes();
+    //     let value = match self.db.entry(DATA_TABLE_ID, &key) {
+    //         rej::Entry::Occupied(e) => e.into_value(),
+    //         rej::Entry::Vacant(e) => match e.insert() {
+    //             Ok(v) => v,
+    //             Err(err) => {
+    //                 log::error!("write ino={ino}, offset={offset}, error: {err}");
+    //                 reply.error(Errno::EIO as _);
+    //                 return;
+    //             }
+    //         },
+    //     };
 
-        if offset < 0 {
-            reply.error(Errno::EINVAL as _);
-            return;
-        }
-        let offset = offset as usize;
-        if let Err(err) = self.db.write_at(value, offset, data) {
-            log::error!("write ino={ino}, offset={offset}, error: {err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
+    //     if offset < 0 {
+    //         reply.error(Errno::EINVAL as _);
+    //         return;
+    //     }
+    //     let offset = offset as usize;
+    //     if let Err(err) = self.db.write_at(value, offset, data) {
+    //         log::error!("write ino={ino}, offset={offset}, error: {err}");
+    //         reply.error(Errno::EIO as _);
+    //         return;
+    //     }
 
-        if let Ok(Some(mut attr)) = schema::retrieve_attr(&self.db, ino) {
-            attr.size = value.length() as _;
-            schema::insert_attr(&self.db, ino, &attr).unwrap_or_default();
-        }
-        reply.written(data.len() as u32);
-    }
+    //     if let Ok(Some(mut attr)) = schema::retrieve_attr(&self.db, ino) {
+    //         attr.size = value.length() as _;
+    //         schema::insert_attr(&self.db, ino, &attr).unwrap_or_default();
+    //     }
+    //     reply.written(data.len() as u32);
+    // }
 
     fn flush(
         &mut self,

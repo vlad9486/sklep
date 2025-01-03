@@ -1,10 +1,10 @@
-use std::{ffi::OsStr, hash::Hasher};
+use std::{ffi::OsStr, hash::Hasher, mem};
 
 use rej::{Db, DbError, DbIterator, Entry};
 use seahash::SeaHasher;
 use thiserror::Error;
 
-use super::plain::{PlainData, StParseError, Attributes, DirectoryEntry};
+use super::plain::{PlainData, RecognizeError, Attributes, DirectoryEntry};
 
 /// () -> seed
 const SPECIAL_TABLE_ID: u32 = 0;
@@ -18,15 +18,25 @@ pub enum SchemaError {
     #[error("{0}")]
     Db(#[from] DbError),
     #[error("parse {0}")]
-    Parse(#[from] StParseError),
+    Parse(#[from] RecognizeError),
     #[error("hash collision")]
     HashCollision,
 }
 
 pub fn init_seed(db: &Db, seed: &mut [u8]) -> Result<[u64; 4], DbError> {
     match db.entry(SPECIAL_TABLE_ID, &[]) {
-        Entry::Vacant(e) => db.rewrite(e.insert()?, &*seed)?,
-        Entry::Occupied(e) => e.into_value().read(0, seed),
+        Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, &*seed)?,
+        Entry::Occupied(e) => {
+            let value = e.into_value();
+            let mut buf = [0; 8];
+            value.read(true, 0, &mut buf);
+            if u64::from_le_bytes(buf) == 32 {
+                value.read(true, 12, seed);
+                db.write_at(value, true, 0, &*seed)?;
+            } else {
+                value.read(true, 0, seed)
+            }
+        }
     }
     let mut it = seed
         .chunks(8)
@@ -67,8 +77,8 @@ pub fn insert_dir_entry(
 ) -> Result<(), SchemaError> {
     let key = DirEntryKey::new(seed, parent_ino, entry.name());
     match db.entry(INODE_TABLE_ID, &key.raw) {
-        Entry::Vacant(e) => db.rewrite(e.insert()?, entry.as_bytes())?,
-        Entry::Occupied(e) if rewrite => db.rewrite(e.into_value(), entry.as_bytes())?,
+        Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, entry.as_bytes())?,
+        Entry::Occupied(e) if rewrite => db.write_at(e.into_value(), true, 0, entry.as_bytes())?,
         Entry::Occupied(_) => return Err(SchemaError::HashCollision),
     }
 
@@ -80,12 +90,14 @@ pub fn lookup_dir(
     seed: [u64; 4],
     parent_ino: u64,
     name: &OsStr,
-) -> Result<Option<u64>, StParseError> {
+) -> Result<Option<u64>, RecognizeError> {
     let key = DirEntryKey::new(seed, parent_ino, name);
     let Some(entry) = db.entry(INODE_TABLE_ID, &key.raw).occupied() else {
         return Ok(None);
     };
-    let data = entry.into_value().read_to_vec();
+    let data = entry
+        .into_value()
+        .read_to_vec(true, 0, mem::size_of::<DirectoryEntry>());
     let entry = DirectoryEntry::recognize(&data)?.0;
     Ok(Some(entry.ino()))
 }
@@ -114,7 +126,9 @@ pub fn next_ino(
         return Ok(None);
     }
 
-    Ok(Some(DirectoryEntry::recognize(&value.read_to_vec())?.0))
+    let data = value.read_to_vec(true, 0, mem::size_of::<DirectoryEntry>());
+    let (dir, _) = DirectoryEntry::recognize(&data)?;
+    Ok(Some(dir))
 }
 
 pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> {
@@ -124,19 +138,21 @@ pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> 
         Entry::Occupied(e) => e.into_value(),
         Entry::Vacant(e) => e.insert()?,
     };
-    db.rewrite(value, attr.as_bytes())?;
+    db.write_at(value, true, 0, attr.as_bytes())?;
 
     Ok(())
 }
 
-pub fn retrieve_attr(db: &Db, ino: u64) -> Result<Option<Attributes>, StParseError> {
+pub fn retrieve_attr(db: &Db, ino: u64) -> Result<Option<Attributes>, RecognizeError> {
     let mut ino_bytes = [0; 8];
     ino_bytes.clone_from_slice(&ino.to_le_bytes());
 
     let Some(entry) = db.entry(ATTR_TABLE_ID, &ino_bytes).occupied() else {
         return Ok(None);
     };
-    let data = entry.into_value().read_to_vec();
+    let data = entry
+        .into_value()
+        .read_to_vec(true, 0, mem::size_of::<Attributes>());
     let (attr, _) = Attributes::recognize(&data)?;
     Ok(Some(attr))
 }
