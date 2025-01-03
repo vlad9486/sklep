@@ -180,6 +180,11 @@ impl Attributes {
         self
     }
 
+    pub fn unlink(&mut self) -> bool {
+        self.nlink -= 1;
+        self.nlink == 0
+    }
+
     pub fn fty(&self) -> (FileType, bool, bool) {
         // # Safety:
         // the `self` is guaranteed to be valid by construction

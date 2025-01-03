@@ -10,9 +10,9 @@ use super::plain::{PlainData, RecognizeError, Attributes, DirectoryEntry};
 /// () -> seed
 const SPECIAL_TABLE_ID: u32 = 0;
 /// (parent_ino, hash(filename)) -> (ino, filename)
-pub const INODE_TABLE_ID: u32 = 1;
+pub const DIR_TABLE: u32 = 1;
 /// ino -> attr
-pub const ATTR_TABLE_ID: u32 = 9;
+pub const INODE_TABLE: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
@@ -55,7 +55,7 @@ pub fn insert_dir_entry(
     rewrite: bool,
 ) -> Result<(), SchemaError> {
     let key = dir_entry_key(seed, parent_ino, entry.name());
-    match db.entry(INODE_TABLE_ID, &key) {
+    match db.entry(DIR_TABLE, &key) {
         Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, entry.as_bytes())?,
         Entry::Occupied(e) if rewrite => db.write_at(e.into_value(), true, 0, entry.as_bytes())?,
         Entry::Occupied(_) => return Err(SchemaError::HashCollision),
@@ -71,7 +71,7 @@ pub fn remove_dir_entry(
     name: &OsStr,
 ) -> Result<Option<DirectoryEntry>, SchemaError> {
     let key = dir_entry_key(seed, parent_ino, name);
-    match db.entry(INODE_TABLE_ID, &key) {
+    match db.entry(DIR_TABLE, &key) {
         Entry::Occupied(e) => {
             let mut value = [0; mem::size_of::<DirectoryEntry>()];
             e.remove()?.read(true, 0, &mut value);
@@ -87,13 +87,13 @@ pub fn lookup_dir(
     seed: [u64; 4],
     parent_ino: u64,
     name: &OsStr,
-) -> Result<Option<u64>, RecognizeError> {
+) -> Result<Option<u64>, SchemaError> {
     if name == "." {
         return Ok(Some(parent_ino));
     }
 
     let key = dir_entry_key(seed, parent_ino, name);
-    let Some(entry) = db.entry(INODE_TABLE_ID, &key).occupied() else {
+    let Some(entry) = db.entry(DIR_TABLE, &key).occupied() else {
         return Ok(None);
     };
     let data = entry
@@ -114,7 +114,7 @@ impl<'a> DirIterator<'a> {
     pub fn new(db: &'a Db, parent_ino: u64) -> Self {
         let mut key = [0; 16];
         key[..8].clone_from_slice(&parent_ino.to_le_bytes());
-        let inner = db.entry(INODE_TABLE_ID, &key).into_db_iter();
+        let inner = db.entry(DIR_TABLE, &key).into_db_iter();
         DirIterator {
             db,
             parent_ino,
@@ -139,7 +139,7 @@ impl Iterator for DirIterator<'_> {
             )))
         } else {
             let (table_id, key, value) = self.db.next(&mut self.inner)?;
-            if table_id != INODE_TABLE_ID {
+            if table_id != DIR_TABLE {
                 return None;
             }
             let (prefix, _) = key.split_first_chunk()?;
@@ -157,9 +157,9 @@ impl Iterator for DirIterator<'_> {
     }
 }
 
-pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> {
+pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), SchemaError> {
     let ino_bytes = ino.to_le_bytes();
-    let entry = db.entry(ATTR_TABLE_ID, &ino_bytes);
+    let entry = db.entry(INODE_TABLE, &ino_bytes);
     let value = match entry {
         Entry::Occupied(e) => e.into_value(),
         Entry::Vacant(e) => e.insert()?,
@@ -169,13 +169,15 @@ pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> 
     Ok(())
 }
 
-pub fn remove_attribute(db: &Db, ino: u64) -> Result<(), DbError> {
+pub fn remove_attribute(db: &Db, ino: u64) -> Result<(), SchemaError> {
     let ino_bytes = ino.to_le_bytes();
-    let entry = db.entry(ATTR_TABLE_ID, &ino_bytes);
+    let entry = db.entry(INODE_TABLE, &ino_bytes);
     let Entry::Occupied(entry) = entry else {
         return Ok(());
     };
-    entry.remove().map(drop)
+    entry.remove().map(drop)?;
+
+    Ok(())
 }
 
 pub fn retrieve_attr<'db, 'data>(
@@ -186,7 +188,7 @@ pub fn retrieve_attr<'db, 'data>(
     let mut ino_bytes = [0; 8];
     ino_bytes.clone_from_slice(&ino.to_le_bytes());
 
-    let value = match db.entry(ATTR_TABLE_ID, &ino_bytes) {
+    let value = match db.entry(INODE_TABLE, &ino_bytes) {
         Entry::Occupied(e) => e.into_value(),
         Entry::Vacant(_e) => {
             log::warn!("missing attributes for ino={ino}, creating...");
@@ -198,7 +200,7 @@ pub fn retrieve_attr<'db, 'data>(
     match Attributes::recognize(attributes) {
         Err(err) => {
             log::warn!("bad attribute {ino}, error: {err}");
-            if let Err(err) = db.entry(ATTR_TABLE_ID, &ino_bytes).occupied()?.remove() {
+            if let Err(err) = db.entry(INODE_TABLE, &ino_bytes).occupied()?.remove() {
                 log::warn!("failed to remove attribute {ino}, error: {err}");
             }
             None

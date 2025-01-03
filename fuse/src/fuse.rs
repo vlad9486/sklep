@@ -1,8 +1,10 @@
 use std::{ffi::OsStr, io, path::Path};
 
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite,
+    Request,
 };
+use thiserror::Error;
 use zeroize::Zeroize;
 use nix::errno::Errno;
 
@@ -10,6 +12,26 @@ use super::{
     schema, time,
     plain::{PlainData, Attributes, DirectoryEntry},
 };
+
+#[derive(Debug, Error)]
+pub enum FsError {
+    #[error("{0}")]
+    Schema(#[from] schema::SchemaError),
+    #[error("no such entry")]
+    NoEntry,
+    #[error("limit on file size")]
+    NoSpace,
+}
+
+impl FsError {
+    pub fn errno(&self) -> i32 {
+        match self {
+            Self::Schema(_) => Errno::EIO as _,
+            Self::NoEntry => Errno::ENOENT as _,
+            Self::NoSpace => Errno::ENOSPC as _,
+        }
+    }
+}
 
 pub struct SklepFs {
     db: rej::Db,
@@ -68,8 +90,8 @@ impl SklepFs {
     fn check(&self) -> Result<(), schema::SchemaError> {
         log::info!("check...");
 
-        let mut it = self.db.entry(schema::INODE_TABLE_ID, &[]).into_db_iter();
-        while let Some((schema::INODE_TABLE_ID, key, v)) = self.db.next(&mut it) {
+        let mut it = self.db.entry(schema::DIR_TABLE, &[]).into_db_iter();
+        while let Some((schema::DIR_TABLE, key, v)) = self.db.next(&mut it) {
             let (dir_entry, rewrite) = DirectoryEntry::recognize(&v.read_to_vec(true, 0, 0x1000))?;
 
             let ino = <[u8; 8]>::try_from(&key[..8])
@@ -85,9 +107,9 @@ impl SklepFs {
             }
         }
 
-        let mut it = self.db.entry(schema::ATTR_TABLE_ID, &[]).into_db_iter();
+        let mut it = self.db.entry(schema::INODE_TABLE, &[]).into_db_iter();
         let mut keys = vec![];
-        while let Some((schema::ATTR_TABLE_ID, key, v)) = self.db.next(&mut it) {
+        while let Some((schema::INODE_TABLE, key, v)) = self.db.next(&mut it) {
             let ino = <[u8; 8]>::try_from(key.as_slice())
                 .map(u64::from_le_bytes)
                 .unwrap_or_default();
@@ -103,7 +125,7 @@ impl SklepFs {
         for (ino, key) in keys {
             if let Err(err) = self
                 .db
-                .entry(schema::ATTR_TABLE_ID, &key)
+                .entry(schema::INODE_TABLE, &key)
                 .occupied()
                 .expect("must exist")
                 .remove()
@@ -114,27 +136,147 @@ impl SklepFs {
 
         Ok(())
     }
+
+    pub fn fs_lookup(&self, parent_ino: u64, name: &OsStr) -> Result<(Attributes, u64), FsError> {
+        let ino =
+            schema::lookup_dir(&self.db, self.seed, parent_ino, name)?.ok_or(FsError::NoEntry)?;
+        let mut page = [0; 0x100];
+        let (_, attr, _) =
+            schema::retrieve_attr(&self.db, ino, &mut page).ok_or(FsError::NoEntry)?;
+        Ok((*attr, ino))
+    }
+
+    pub fn fs_change_attributes<F>(&self, ino: u64, f: F) -> Result<Attributes, FsError>
+    where
+        F: Fn(&mut Attributes),
+    {
+        let mut page = [0; 0x100];
+        let (_, attr, _) =
+            schema::retrieve_attr(&self.db, ino, &mut page).ok_or(FsError::NoEntry)?;
+        f(attr);
+        schema::insert_attr(&self.db, ino, &*attr).map_err(FsError::Schema)?;
+
+        Ok(*attr)
+    }
+
+    pub fn fs_mkdir(
+        &self,
+        parent_ino: u64,
+        name: &OsStr,
+        attr: Attributes,
+    ) -> Result<u64, FsError> {
+        // TODO:
+        let ino = 5u64;
+        schema::insert_attr(&self.db, ino, &attr)?;
+        let entry = DirectoryEntry::from_attr(ino, &attr, name);
+        schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false)?;
+        let entry = DirectoryEntry::from_attr(parent_ino, &attr, OsStr::new(".."));
+        schema::insert_dir_entry(&self.db, self.seed, ino, entry, false)?;
+
+        Ok(ino)
+    }
+
+    pub fn fs_unlink(&self, parent_ino: u64, name: &OsStr) -> Result<(), FsError> {
+        let entry = schema::remove_dir_entry(&self.db, self.seed, parent_ino, name)?
+            .ok_or(FsError::NoEntry)?;
+
+        let mut page = [0; 0x100];
+        let (value, attr, _) =
+            schema::retrieve_attr(&self.db, entry.ino(), &mut page).ok_or(FsError::NoEntry)?;
+        if attr.unlink() {
+            schema::remove_attribute(&self.db, entry.ino())?;
+        } else {
+            self.db
+                .write_at(value, true, 0, &page)
+                .map_err(schema::SchemaError::Db)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn fs_remove_dir(&self, parent_ino: u64, name: &OsStr) -> Result<(), FsError> {
+        let entry = schema::remove_dir_entry(&self.db, self.seed, parent_ino, name)?
+            .ok_or(FsError::NoEntry)?;
+        schema::remove_dir_entry(&self.db, self.seed, entry.ino(), OsStr::new(".."))?;
+
+        let mut page = [0; 0x100];
+        let (value, attr, _) =
+            schema::retrieve_attr(&self.db, entry.ino(), &mut page).ok_or(FsError::NoEntry)?;
+        if attr.unlink() {
+            schema::remove_attribute(&self.db, entry.ino())?;
+        } else {
+            self.db
+                .write_at(value, true, 0, &page)
+                .map_err(schema::SchemaError::Db)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn fs_read<'a>(
+        &self,
+        ino: u64,
+        offset: usize,
+        size: usize,
+        page: &'a mut [u8],
+    ) -> Result<&'a [u8], FsError> {
+        let (_, attr, data) = schema::retrieve_attr(&self.db, ino, page).ok_or(FsError::NoEntry)?;
+        let offset = offset.min(attr.size as usize);
+
+        Ok(&data[offset..(offset + size).min(attr.size as usize)])
+    }
+
+    pub fn fs_write(&self, ino: u64, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        let mut page = [0; 0x1000];
+        let (value, attr, old) =
+            schema::retrieve_attr(&self.db, ino, &mut page).ok_or(FsError::NoEntry)?;
+
+        let available = (old.len() + offset).min(0xf00);
+        if available <= offset {
+            return Err(FsError::NoSpace);
+        }
+        let cut = &mut old[offset..];
+        let written = cut.len().min(data.len());
+        cut[..written].clone_from_slice(&data[..written]);
+
+        let new_edge = (offset + written) as u64;
+        if new_edge > attr.size {
+            attr.size = new_edge;
+        }
+        attr.set_mtime();
+        self.db
+            .write_at(value, true, 0, &page)
+            .map_err(schema::SchemaError::Db)?;
+
+        Ok(written)
+    }
+
+    pub fn fs_create(
+        &self,
+        parent_ino: u64,
+        name: &OsStr,
+        attr: Attributes,
+    ) -> Result<u64, FsError> {
+        // TODO:
+        let ino = 4u64;
+        // should return inode number (ino)
+        schema::insert_attr(&self.db, ino, &attr)?;
+        let entry = DirectoryEntry::from_attr(ino, &attr, name);
+        schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false)?;
+
+        Ok(ino)
+    }
 }
 
 impl Filesystem for SklepFs {
     fn lookup(&mut self, _req: &Request, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
-        let ino = match schema::lookup_dir(&self.db, self.seed, parent_ino, name) {
+        match self.fs_lookup(parent_ino, name) {
+            Ok((attr, ino)) => reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0),
             Err(err) => {
-                log::error!("lookup dir, name={}, error {err}", name.to_string_lossy());
-                reply.error(Errno::EIO as _);
-                return;
+                log::error!("lookup dir, parent={parent_ino}, name={name:?}, error {err}");
+                reply.error(err.errno());
             }
-            Ok(None) => {
-                reply.error(Errno::ENOENT as _);
-                return;
-            }
-            Ok(Some(v)) => v,
-        };
-        let mut page = [0; 0x100];
-        match schema::retrieve_attr(&self.db, ino, &mut page) {
-            None => reply.error(Errno::ENOENT as _),
-            Some((_, attr, _)) => reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0),
-        };
+        }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -163,29 +305,24 @@ impl Filesystem for SklepFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let mut page = [0; 0x100];
-        let attr = match schema::retrieve_attr(&self.db, ino, &mut page) {
-            None => {
-                reply.error(Errno::ENOENT as _);
-                return;
+        let res = self.fs_change_attributes(ino, |attr| {
+            if let Some(v) = size {
+                attr.size = v;
             }
-            Some((_, v, _)) => v,
-        };
-        if let Some(v) = size {
-            attr.size = v;
+            if let Some(v) = mtime {
+                attr.mtime_sec = time::fuser(v).0;
+            }
+            if let Some(v) = crtime {
+                attr.crtime_sec = time::system(v).0;
+            }
+        });
+        match res {
+            Ok(attr) => reply.attr(&time::TTL, &attr.posix_attr(self.uid, ino)),
+            Err(err) => {
+                log::error!("change attr, ino={ino}, error {err}");
+                reply.error(err.errno());
+            }
         }
-        if let Some(v) = mtime {
-            attr.mtime_sec = time::fuser(v).0;
-        }
-        if let Some(v) = crtime {
-            attr.crtime_sec = time::system(v).0;
-        }
-        if let Err(err) = schema::insert_attr(&self.db, ino, &*attr) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-        reply.attr(&time::TTL, &attr.posix_attr(self.uid, ino));
     }
 
     fn mkdir(
@@ -199,63 +336,32 @@ impl Filesystem for SklepFs {
     ) {
         let ro = mode & 0o200 == 0;
         let attr = Attributes::new(FileType::Directory, ro, false).inc_link();
-
-        // TODO:
-        let ino = 5u64;
-        // should return inode number (ino)
-        if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
+        match self.fs_mkdir(parent_ino, name, attr) {
+            Ok(ino) => reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0),
+            Err(err) => {
+                log::error!("remove dir, parent={parent_ino}, name={name:?}, error {err}");
+                reply.error(err.errno());
+            }
         }
-
-        let entry = DirectoryEntry::from_attr(ino, &attr, name);
-        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-
-        let entry = DirectoryEntry::from_attr(parent_ino, &attr, OsStr::new(".."));
-        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, ino, entry, false) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-
-        reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0);
     }
 
-    fn rmdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent_ino: u64,
-        name: &OsStr,
-        reply: fuser::ReplyEmpty,
-    ) {
-        match schema::remove_dir_entry(&self.db, self.seed, parent_ino, name) {
+    fn unlink(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.fs_unlink(parent_ino, name) {
             Err(err) => {
-                log::error!("{err}");
-                reply.error(Errno::EIO as _);
+                log::error!("unlink, parent={parent_ino}, name={name:?}, error {err}");
+                reply.error(err.errno());
             }
-            Ok(None) => {
-                reply.error(Errno::ENOENT as _);
+            Ok(()) => reply.ok(),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.fs_unlink(parent_ino, name) {
+            Err(err) => {
+                log::error!("rmdir, parent={parent_ino}, name={name:?}, error {err}");
+                reply.error(err.errno());
             }
-            Ok(Some(entry)) => {
-                if let Err(err) =
-                    schema::remove_dir_entry(&self.db, self.seed, entry.ino(), OsStr::new(".."))
-                {
-                    log::error!("{err}");
-                    reply.error(Errno::EIO as _);
-                    return;
-                }
-                if let Err(err) = schema::remove_attribute(&self.db, entry.ino()) {
-                    log::error!("{err}");
-                    reply.error(Errno::EIO as _);
-                    return;
-                }
-                reply.ok();
-            }
+            Ok(()) => reply.ok(),
         }
     }
 
@@ -271,29 +377,13 @@ impl Filesystem for SklepFs {
         reply: ReplyData,
     ) {
         let mut page = [0; 0x1000];
-        let (_, attr, data) = match schema::retrieve_attr(&self.db, ino, &mut page) {
-            None => {
-                reply.error(Errno::ENOENT as _);
-                return;
+        match self.fs_read(ino, offset as usize, size as usize, &mut page) {
+            Err(err) => {
+                log::error!("read, ino={ino}, error {err}");
+                reply.error(err.errno());
             }
-            Some(v) => v,
-        };
-
-        if offset < 0 {
-            reply.error(Errno::EINVAL as _);
-            return;
+            Ok(data) => reply.data(data),
         }
-        let offset = offset as usize;
-        let size = size as usize;
-
-        if offset > attr.size as usize {
-            reply.data(&[]);
-            return;
-        }
-        let size = (offset + size).min(attr.size as usize) - offset;
-
-        // TODO: big value
-        reply.data(&data[..size]);
     }
 
     fn write(
@@ -308,42 +398,13 @@ impl Filesystem for SklepFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let mut page = [0; 0x1000];
-        let (value, attr, old) = match schema::retrieve_attr(&self.db, ino, &mut page) {
-            None => {
-                reply.error(Errno::ENOENT as _);
-                return;
+        match self.fs_write(ino, offset as usize, data) {
+            Err(err) => {
+                log::error!("write, ino={ino}, error {err}");
+                reply.error(err.errno());
             }
-            Some(v) => v,
-        };
-
-        if offset < 0 {
-            reply.error(Errno::EINVAL as _);
-            return;
+            Ok(written) => reply.written(written as u32),
         }
-        let offset = offset as usize;
-
-        let available = (old.len() + offset).min(0xf00);
-        if available <= offset {
-            reply.error(Errno::ENOSPC as _);
-            return;
-        }
-        let cut = &mut old[offset..];
-        let written = cut.len().min(data.len());
-        cut[..written].clone_from_slice(&data[..written]);
-
-        let new_edge = (offset + written) as u64;
-        if new_edge > attr.size {
-            attr.size = new_edge;
-        }
-        attr.set_mtime();
-        if let Err(err) = self.db.write_at(value, true, 0, &page) {
-            log::error!("failed to write ino: {ino}, error: {err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-
-        reply.written(written as u32);
     }
 
     fn flush(
@@ -377,7 +438,7 @@ impl Filesystem for SklepFs {
                     }
                 }
                 Err(err) => {
-                    log::error!("{err}");
+                    log::error!("readdir, offset={offset}, error {err}");
                     reply.error(Errno::EIO as _);
                     return;
                 }
@@ -400,22 +461,12 @@ impl Filesystem for SklepFs {
         let ro = mode & 0o200 == 0;
         let ex = mode & 0o100 != 0;
         let attr = Attributes::new(FileType::RegularFile, ro, ex).inc_link();
-        // TODO:
-        let ino = 4u64;
-        // should return inode number (ino)
-        if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
+        match self.fs_create(parent_ino, name, attr) {
+            Err(err) => {
+                log::error!("create, parent={parent_ino}, error {err}");
+                reply.error(err.errno());
+            }
+            Ok(ino) => reply.created(&time::TTL, &attr.posix_attr(self.uid, ino), 0, 0, 0),
         }
-
-        let entry = DirectoryEntry::from_attr(ino, &attr, name);
-        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false) {
-            log::error!("{err}");
-            reply.error(Errno::EIO as _);
-            return;
-        }
-
-        reply.created(&time::TTL, &attr.posix_attr(self.uid, ino), 0, 0, 0);
     }
 }
