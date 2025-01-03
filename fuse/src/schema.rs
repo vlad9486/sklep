@@ -39,23 +39,16 @@ pub fn init_seed(db: &Db, seed: &mut [u8]) -> Result<[u64; 4], DbError> {
     ])
 }
 
-struct DirEntryKey {
-    raw: [u8; 0x10],
-}
+pub fn dir_entry_key(seed: [u64; 4], parent_ino: u64, name: &OsStr) -> [u8; 0x10] {
+    let [k1, k2, k3, k4] = seed;
+    let mut hasher = SeaHasher::with_seeds(k1, k2, k3, k4);
+    Hasher::write(&mut hasher, name.as_encoded_bytes());
+    let hash = hasher.finish().to_le_bytes();
 
-impl DirEntryKey {
-    pub fn new(seed: [u64; 4], parent_ino: u64, name: &OsStr) -> Self {
-        let [k1, k2, k3, k4] = seed;
-        let mut hasher = SeaHasher::with_seeds(k1, k2, k3, k4);
-        Hasher::write(&mut hasher, name.as_encoded_bytes());
-        let hash = hasher.finish().to_le_bytes();
-
-        let mut raw = [0; 0x10];
-        raw[..8].clone_from_slice(&parent_ino.to_le_bytes());
-        raw[8..].clone_from_slice(&hash);
-
-        DirEntryKey { raw }
-    }
+    let mut raw = [0; 0x10];
+    raw[..8].clone_from_slice(&parent_ino.to_le_bytes());
+    raw[8..].clone_from_slice(&hash);
+    raw
 }
 
 pub fn insert_dir_entry(
@@ -65,8 +58,8 @@ pub fn insert_dir_entry(
     entry: DirectoryEntry,
     rewrite: bool,
 ) -> Result<(), SchemaError> {
-    let key = DirEntryKey::new(seed, parent_ino, entry.name());
-    match db.entry(INODE_TABLE_ID, &key.raw) {
+    let key = dir_entry_key(seed, parent_ino, entry.name());
+    match db.entry(INODE_TABLE_ID, &key) {
         Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, entry.as_bytes())?,
         Entry::Occupied(e) if rewrite => db.write_at(e.into_value(), true, 0, entry.as_bytes())?,
         Entry::Occupied(_) => return Err(SchemaError::HashCollision),
@@ -75,14 +68,32 @@ pub fn insert_dir_entry(
     Ok(())
 }
 
+pub fn remove_dir_entry(
+    db: &Db,
+    seed: [u64; 4],
+    parent_ino: u64,
+    name: &OsStr,
+) -> Result<Option<DirectoryEntry>, SchemaError> {
+    let key = dir_entry_key(seed, parent_ino, name);
+    match db.entry(INODE_TABLE_ID, &key) {
+        Entry::Occupied(e) => {
+            let mut value = [0; mem::size_of::<DirectoryEntry>()];
+            e.remove()?.read(true, 0, &mut value);
+            let (entry, _) = DirectoryEntry::recognize(&value)?;
+            Ok(Some(entry))
+        }
+        Entry::Vacant(_) => Ok(None),
+    }
+}
+
 pub fn lookup_dir(
     db: &Db,
     seed: [u64; 4],
     parent_ino: u64,
     name: &OsStr,
 ) -> Result<Option<u64>, RecognizeError> {
-    let key = DirEntryKey::new(seed, parent_ino, name);
-    let Some(entry) = db.entry(INODE_TABLE_ID, &key.raw).occupied() else {
+    let key = dir_entry_key(seed, parent_ino, name);
+    let Some(entry) = db.entry(INODE_TABLE_ID, &key).occupied() else {
         return Ok(None);
     };
     let data = entry
@@ -133,6 +144,15 @@ pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> 
     Ok(())
 }
 
+pub fn remove_attribute(db: &Db, ino: u64) -> Result<(), DbError> {
+    let ino_bytes = ino.to_le_bytes();
+    let entry = db.entry(ATTR_TABLE_ID, &ino_bytes);
+    let Entry::Occupied(entry) = entry else {
+        return Ok(());
+    };
+    entry.remove().map(drop)
+}
+
 pub fn retrieve_attr<'db, 'data>(
     db: &'db Db,
     ino: u64,
@@ -143,12 +163,9 @@ pub fn retrieve_attr<'db, 'data>(
 
     let value = match db.entry(ATTR_TABLE_ID, &ino_bytes) {
         Entry::Occupied(e) => e.into_value(),
-        Entry::Vacant(e) => {
+        Entry::Vacant(_e) => {
             log::warn!("missing attributes for ino={ino}, creating...");
-            let value = e.insert().ok()?;
-            let attr = Attributes::new(fuser::FileType::RegularFile, false, false).inc_link();
-            db.write_at(value, true, 0, attr.as_bytes()).ok()?;
-            value
+            return None;
         }
     };
     value.read(true, 0, page);

@@ -266,6 +266,7 @@ impl DirectoryEntry {
                 Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             }
         } else {
+            log::error!("recognize entry, magic is wrong");
             Err(RecognizeError::Unrecognized)
         }
     }

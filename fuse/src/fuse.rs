@@ -66,10 +66,6 @@ impl SklepFs {
     fn populate(&self) -> Result<(), schema::SchemaError> {
         let attr = Attributes::new(FileType::Directory, false, false).inc_link();
         schema::insert_attr(&self.db, 1, &attr)?;
-        let entry = DirectoryEntry::from_attr(1, &attr, OsStr::new("."));
-        schema::insert_dir_entry(&self.db, self.seed, 1, entry, false)?;
-        let entry = DirectoryEntry::from_attr(1, &attr, OsStr::new(".."));
-        schema::insert_dir_entry(&self.db, self.seed, 1, entry, false)?;
 
         Ok(())
     }
@@ -78,8 +74,14 @@ impl SklepFs {
         log::info!("check...");
 
         let mut it = self.db.entry(schema::INODE_TABLE_ID, &[]).into_db_iter();
-        while let Some((schema::INODE_TABLE_ID, _, v)) = self.db.next(&mut it) {
+        while let Some((schema::INODE_TABLE_ID, key, v)) = self.db.next(&mut it) {
             let (dir_entry, rewrite) = DirectoryEntry::recognize(&v.read_to_vec(true, 0, 0x1000))?;
+
+            let ino = <[u8; 8]>::try_from(&key[..8])
+                .map(u64::from_le_bytes)
+                .unwrap_or_default();
+            log::debug!("directory: {ino}, entry: {dir_entry}");
+
             if rewrite {
                 log::warn!("fix directory entry {dir_entry}");
                 if let Err(err) = self.db.write_at(v, true, 0, dir_entry.as_bytes()) {
@@ -91,12 +93,15 @@ impl SklepFs {
         let mut it = self.db.entry(schema::ATTR_TABLE_ID, &[]).into_db_iter();
         let mut keys = vec![];
         while let Some((schema::ATTR_TABLE_ID, key, v)) = self.db.next(&mut it) {
-            if let Err(err) = Attributes::recognize(&mut v.read_to_vec(true, 0, 0x1000)) {
-                let ino = <[u8; 8]>::try_from(key.as_slice())
-                    .map(u64::from_le_bytes)
-                    .unwrap_or_default();
-                log::warn!("bad attribute {ino}, error: {err}");
-                keys.push((ino, key));
+            let ino = <[u8; 8]>::try_from(key.as_slice())
+                .map(u64::from_le_bytes)
+                .unwrap_or_default();
+            match Attributes::recognize(&mut v.read_to_vec(true, 0, 0x1000)) {
+                Ok((attributes, _)) => log::debug!("item: {ino}, attributes: {attributes}"),
+                Err(err) => {
+                    log::warn!("bad attribute {ino}, error: {err}");
+                    keys.push((ino, key));
+                }
             }
         }
 
@@ -201,6 +206,65 @@ impl Filesystem for SklepFs {
             return;
         }
         reply.attr(&TTL, &attr.posix_attr(self.uid, ino));
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent_ino: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let ro = mode & 0o200 == 0;
+        let attr = Attributes::new(FileType::Directory, ro, false).inc_link();
+
+        // TODO:
+        let ino = 5u64;
+        // should return inode number (ino)
+        if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
+            log::error!("{err}");
+            reply.error(Errno::EIO as _);
+            return;
+        }
+
+        let entry = DirectoryEntry::from_attr(ino, &attr, name);
+        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, parent_ino, entry, false) {
+            log::error!("{err}");
+            reply.error(Errno::EIO as _);
+            return;
+        }
+
+        reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0);
+    }
+
+    fn rmdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent_ino: u64,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        match schema::remove_dir_entry(&self.db, self.seed, parent_ino, name) {
+            Err(err) => {
+                log::error!("{err}");
+                reply.error(Errno::EIO as _);
+                return;
+            }
+            Ok(None) => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Ok(Some(entry)) => {
+                if let Err(err) = schema::remove_attribute(&self.db, entry.ino()) {
+                    log::error!("{err}");
+                    reply.error(Errno::EIO as _);
+                    return;
+                }
+                reply.ok();
+            }
+        }
     }
 
     fn read(
