@@ -4,11 +4,12 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
     os::unix::ffi::OsStrExt,
     slice,
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fuser::{FileAttr, FileType};
 use thiserror::Error;
+
+use super::time;
 
 /// # Safety
 /// `Self` must:
@@ -129,8 +130,8 @@ impl Attributes {
     }
 
     pub fn posix_attr(self, uid: u32, ino: u64) -> FileAttr {
-        let mtime = UNIX_EPOCH + Duration::from_secs(self.mtime_sec);
-        let crtime = UNIX_EPOCH + Duration::from_secs(self.crtime_sec);
+        let mtime = time::to_system(self.mtime_sec, 0);
+        let crtime = time::to_system(self.crtime_sec, 0);
 
         let (kind, ro, ex) = self.fty();
         let ex = ex | matches!(kind, FileType::Directory);
@@ -157,10 +158,7 @@ impl Attributes {
     }
 
     pub fn new(fty: FileType, ro: bool, ex: bool) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("cannot fail")
-            .as_secs();
+        let now = time::now().0;
         Attributes {
             magic: Some(Self::MAGIC),
             version: Self::VERSION,
@@ -173,10 +171,7 @@ impl Attributes {
     }
 
     pub fn set_mtime(&mut self) {
-        self.mtime_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("cannot fail")
-            .as_secs();
+        self.mtime_sec = time::now().0;
     }
 
     #[must_use]
@@ -203,16 +198,8 @@ impl From<FileAttr> for Attributes {
             kind: Some(fty_to_u16(value.kind, ro, ex)),
             nlink: value.nlink,
             size: value.size,
-            mtime_sec: value
-                .mtime
-                .duration_since(UNIX_EPOCH)
-                .expect("cannot fail")
-                .as_secs(),
-            crtime_sec: value
-                .crtime
-                .duration_since(UNIX_EPOCH)
-                .expect("cannot fail")
-                .as_secs(),
+            mtime_sec: time::system(value.mtime).0,
+            crtime_sec: time::system(value.crtime).0,
         }
     }
 }

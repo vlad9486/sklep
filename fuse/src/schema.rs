@@ -29,15 +29,10 @@ pub fn init_seed(db: &Db, seed: &mut [u8]) -> Result<[u64; 4], DbError> {
         Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, &*seed)?,
         Entry::Occupied(e) => e.into_value().read(true, 0, seed),
     }
-    let mut it = seed
+    let it = seed
         .chunks(8)
         .map(|x| u64::from_le_bytes(x.try_into().expect("seed is big enough")));
-    Ok([
-        it.next().expect("seed is big enough"),
-        it.next().expect("seed is big enough"),
-        it.next().expect("seed is big enough"),
-        it.next().expect("seed is big enough"),
-    ])
+    Ok(<[u64; 4]>::try_from(it.collect::<Vec<_>>().as_slice()).expect("seed is big enough"))
 }
 
 pub fn dir_entry_key(seed: [u64; 4], parent_ino: u64, name: &OsStr) -> [u8; 0x10] {
@@ -210,8 +205,9 @@ pub fn retrieve_attr<'db, 'data>(
         }
         Ok((attributes, true)) => {
             log::warn!("fix attributes {attributes}");
-            db.write_at(value, true, 0, attributes.as_bytes())
-                .unwrap_or_default();
+            if let Err(err) = db.write_at(value, true, 0, attributes.as_bytes()) {
+                log::warn!("failed to write fixed attribute {ino}, error: {err}");
+            }
             Some((value, attributes, data))
         }
         Ok((attributes, false)) => Some((value, attributes, data)),

@@ -1,9 +1,4 @@
-use std::{
-    ffi::OsStr,
-    io,
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{ffi::OsStr, io, path::Path};
 
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
@@ -12,11 +7,9 @@ use zeroize::Zeroize;
 use nix::errno::Errno;
 
 use super::{
-    schema,
+    schema, time,
     plain::{PlainData, Attributes, DirectoryEntry},
 };
-
-const TTL: Duration = Duration::from_secs(1); // 1 second
 
 pub struct SklepFs {
     db: rej::Db,
@@ -140,7 +133,7 @@ impl Filesystem for SklepFs {
         let mut page = [0; 0x100];
         match schema::retrieve_attr(&self.db, ino, &mut page) {
             None => reply.error(Errno::ENOENT as _),
-            Some((_, attr, _)) => reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0),
+            Some((_, attr, _)) => reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0),
         };
     }
 
@@ -148,7 +141,7 @@ impl Filesystem for SklepFs {
         let mut page = [0; 0x100];
         match schema::retrieve_attr(&self.db, ino, &mut page) {
             None => reply.error(Errno::ENOENT as _),
-            Some((_, attr, _)) => reply.attr(&TTL, &attr.posix_attr(self.uid, ino)),
+            Some((_, attr, _)) => reply.attr(&time::TTL, &attr.posix_attr(self.uid, ino)),
         }
     }
 
@@ -170,13 +163,6 @@ impl Filesystem for SklepFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        fn unwrap_time(v: fuser::TimeOrNow) -> SystemTime {
-            match v {
-                fuser::TimeOrNow::Now => SystemTime::now(),
-                fuser::TimeOrNow::SpecificTime(t) => t,
-            }
-        }
-
         let mut page = [0; 0x100];
         let attr = match schema::retrieve_attr(&self.db, ino, &mut page) {
             None => {
@@ -189,25 +175,17 @@ impl Filesystem for SklepFs {
             attr.size = v;
         }
         if let Some(v) = mtime {
-            attr.mtime_sec = unwrap_time(v)
-                .duration_since(UNIX_EPOCH)
-                .as_ref()
-                .map(Duration::as_secs)
-                .unwrap_or_default();
+            attr.mtime_sec = time::fuser(v).0;
         }
         if let Some(v) = crtime {
-            attr.crtime_sec = v
-                .duration_since(UNIX_EPOCH)
-                .as_ref()
-                .map(Duration::as_secs)
-                .unwrap_or_default();
+            attr.crtime_sec = time::system(v).0;
         }
         if let Err(err) = schema::insert_attr(&self.db, ino, &*attr) {
             log::error!("{err}");
             reply.error(Errno::EIO as _);
             return;
         }
-        reply.attr(&TTL, &attr.posix_attr(self.uid, ino));
+        reply.attr(&time::TTL, &attr.posix_attr(self.uid, ino));
     }
 
     fn mkdir(
@@ -245,7 +223,7 @@ impl Filesystem for SklepFs {
             return;
         }
 
-        reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0);
+        reply.entry(&time::TTL, &attr.posix_attr(self.uid, ino), 0);
     }
 
     fn rmdir(
@@ -438,6 +416,6 @@ impl Filesystem for SklepFs {
             return;
         }
 
-        reply.created(&TTL, &attr.posix_attr(self.uid, ino), 0, 0, 0);
+        reply.created(&time::TTL, &attr.posix_attr(self.uid, ino), 0, 0, 0);
     }
 }
