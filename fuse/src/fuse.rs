@@ -280,6 +280,7 @@ impl Filesystem for SklepFs {
         if new_edge > attr.size {
             attr.size = new_edge;
         }
+        attr.set_mtime();
         if let Err(err) = self.db.write_at(value, true, 0, &page) {
             log::error!("failed to write ino: {ino}, error: {err}");
             reply.error(Errno::EIO as _);

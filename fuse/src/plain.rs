@@ -4,6 +4,7 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
     os::unix::ffi::OsStrExt,
     slice,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fuser::{FileAttr, FileType};
@@ -128,8 +129,6 @@ impl Attributes {
     }
 
     pub fn posix_attr(self, uid: u32, ino: u64) -> FileAttr {
-        use std::time::{UNIX_EPOCH, Duration};
-
         let mtime = UNIX_EPOCH + Duration::from_secs(self.mtime_sec);
         let crtime = UNIX_EPOCH + Duration::from_secs(self.crtime_sec);
 
@@ -158,20 +157,26 @@ impl Attributes {
     }
 
     pub fn new(fty: FileType, ro: bool, ex: bool) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("cannot fail")
+            .as_secs();
         Attributes {
             magic: Some(Self::MAGIC),
             version: Self::VERSION,
             kind: Some(fty_to_u16(fty, ro, ex)),
             nlink: 0,
             size: 0,
-            mtime_sec: 0,
-            crtime_sec: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("cannot fail")
-                .as_secs(),
+            mtime_sec: now,
+            crtime_sec: now,
         }
+    }
+
+    pub fn set_mtime(&mut self) {
+        self.mtime_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("cannot fail")
+            .as_secs();
     }
 
     #[must_use]
@@ -189,8 +194,6 @@ impl Attributes {
 
 impl From<FileAttr> for Attributes {
     fn from(value: FileAttr) -> Self {
-        use std::time::UNIX_EPOCH;
-
         let ro = value.perm & 0o200 == 0;
         let ex = value.perm & 0o100 != 0;
 
