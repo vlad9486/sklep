@@ -66,6 +66,8 @@ impl SklepFs {
     fn populate(&self) -> Result<(), schema::SchemaError> {
         let attr = Attributes::new(FileType::Directory, false, false).inc_link();
         schema::insert_attr(&self.db, 1, &attr)?;
+        let entry = DirectoryEntry::from_attr(1, &attr, OsStr::new(".."));
+        schema::insert_dir_entry(&self.db, self.seed, 1, entry, true)?;
 
         Ok(())
     }
@@ -236,6 +238,13 @@ impl Filesystem for SklepFs {
             return;
         }
 
+        let entry = DirectoryEntry::from_attr(parent_ino, &attr, OsStr::new(".."));
+        if let Err(err) = schema::insert_dir_entry(&self.db, self.seed, ino, entry, false) {
+            log::error!("{err}");
+            reply.error(Errno::EIO as _);
+            return;
+        }
+
         reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0);
     }
 
@@ -257,6 +266,13 @@ impl Filesystem for SklepFs {
                 return;
             }
             Ok(Some(entry)) => {
+                if let Err(err) =
+                    schema::remove_dir_entry(&self.db, self.seed, entry.ino(), OsStr::new(".."))
+                {
+                    log::error!("{err}");
+                    reply.error(Errno::EIO as _);
+                    return;
+                }
                 if let Err(err) = schema::remove_attribute(&self.db, entry.ino()) {
                     log::error!("{err}");
                     reply.error(Errno::EIO as _);
@@ -373,24 +389,21 @@ impl Filesystem for SklepFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let mut it = schema::iter_dir(&self.db, parent_ino);
-        let mut this_offset = 0;
-        loop {
-            match schema::next_ino(&self.db, parent_ino, &mut it) {
+        let mut iter = schema::DirIterator::new(&self.db, parent_ino)
+            .enumerate()
+            .skip(offset as usize);
+        while let Some((offset, entry)) = iter.next() {
+            let offset = (offset + 1) as i64;
+            match entry {
+                Ok(entry) => {
+                    if reply.add(entry.ino(), offset, entry.fty(), entry.name()) {
+                        break;
+                    }
+                }
                 Err(err) => {
                     log::error!("{err}");
                     reply.error(Errno::EIO as _);
                     return;
-                }
-                Ok(None) => break,
-                Ok(Some(value)) => {
-                    let ino = value.ino();
-                    let fty = value.fty();
-                    let name = value.name();
-                    if this_offset >= offset && reply.add(ino, this_offset + 1, fty, name) {
-                        break;
-                    }
-                    this_offset += 1;
                 }
             }
         }

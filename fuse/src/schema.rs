@@ -1,5 +1,6 @@
 use std::{ffi::OsStr, hash::Hasher, mem};
 
+use fuser::FileType;
 use rej::{Db, DbError, DbIterator, Entry, Value};
 use seahash::SeaHasher;
 use thiserror::Error;
@@ -92,6 +93,10 @@ pub fn lookup_dir(
     parent_ino: u64,
     name: &OsStr,
 ) -> Result<Option<u64>, RecognizeError> {
+    if name == "." {
+        return Ok(Some(parent_ino));
+    }
+
     let key = dir_entry_key(seed, parent_ino, name);
     let Some(entry) = db.entry(INODE_TABLE_ID, &key).occupied() else {
         return Ok(None);
@@ -103,33 +108,58 @@ pub fn lookup_dir(
     Ok(Some(entry.ino()))
 }
 
-pub fn iter_dir(db: &Db, parent_ino: u64) -> DbIterator {
-    let mut key = [0; 16];
-    key[..8].clone_from_slice(&parent_ino.to_le_bytes());
-    db.entry(INODE_TABLE_ID, &key).into_db_iter()
+pub struct DirIterator<'a> {
+    db: &'a Db,
+    parent_ino: u64,
+    inner: DbIterator,
+    dot: bool,
 }
 
-pub fn next_ino(
-    db: &Db,
-    parent_ino: u64,
-    iter: &mut DbIterator,
-) -> Result<Option<DirectoryEntry>, SchemaError> {
-    let Some((table_id, key, value)) = db.next(iter) else {
-        return Ok(None);
-    };
-    if table_id != INODE_TABLE_ID {
-        return Ok(None);
+impl<'a> DirIterator<'a> {
+    pub fn new(db: &'a Db, parent_ino: u64) -> Self {
+        let mut key = [0; 16];
+        key[..8].clone_from_slice(&parent_ino.to_le_bytes());
+        let inner = db.entry(INODE_TABLE_ID, &key).into_db_iter();
+        DirIterator {
+            db,
+            parent_ino,
+            inner,
+            dot: false,
+        }
     }
-    let Some((prefix, _)) = key.split_first_chunk() else {
-        return Ok(None);
-    };
-    if *prefix != parent_ino.to_le_bytes() {
-        return Ok(None);
-    }
+}
 
-    let data = value.read_to_vec(true, 0, mem::size_of::<DirectoryEntry>());
-    let (dir, _) = DirectoryEntry::recognize(&data)?;
-    Ok(Some(dir))
+impl Iterator for DirIterator<'_> {
+    type Item = Result<DirectoryEntry, SchemaError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.dot {
+            self.dot = true;
+            return Some(Ok(DirectoryEntry::new(
+                self.parent_ino,
+                FileType::Directory,
+                false,
+                true,
+                OsStr::new("."),
+            )));
+        } else {
+            let (table_id, key, value) = self.db.next(&mut self.inner)?;
+            if table_id != INODE_TABLE_ID {
+                return None;
+            }
+            let (prefix, _) = key.split_first_chunk()?;
+            if *prefix != self.parent_ino.to_le_bytes() {
+                return None;
+            }
+
+            let data = value.read_to_vec(true, 0, mem::size_of::<DirectoryEntry>());
+            Some(
+                DirectoryEntry::recognize(&data)
+                    .map_err(Into::into)
+                    .map(|(entry, _)| entry),
+            )
+        }
+    }
 }
 
 pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> {
