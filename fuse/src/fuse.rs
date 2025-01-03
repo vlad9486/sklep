@@ -202,7 +202,7 @@ impl Filesystem for SklepFs {
                 .map(Duration::as_secs)
                 .unwrap_or_default();
         }
-        if let Err(err) = schema::insert_attr(&self.db, ino, &attr) {
+        if let Err(err) = schema::insert_attr(&self.db, ino, &*attr) {
             log::error!("{err}");
             reply.error(Errno::EIO as _);
             return;
@@ -259,11 +259,9 @@ impl Filesystem for SklepFs {
             Err(err) => {
                 log::error!("{err}");
                 reply.error(Errno::EIO as _);
-                return;
             }
             Ok(None) => {
                 reply.error(Errno::ENOENT as _);
-                return;
             }
             Ok(Some(entry)) => {
                 if let Err(err) =
@@ -389,10 +387,10 @@ impl Filesystem for SklepFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let mut iter = schema::DirIterator::new(&self.db, parent_ino)
+        let iter = schema::DirIterator::new(&self.db, parent_ino)
             .enumerate()
             .skip(offset as usize);
-        while let Some((offset, entry)) = iter.next() {
+        for (offset, entry) in iter {
             let offset = (offset + 1) as i64;
             match entry {
                 Ok(entry) => {

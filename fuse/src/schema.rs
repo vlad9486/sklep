@@ -135,13 +135,13 @@ impl Iterator for DirIterator<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         if !self.dot {
             self.dot = true;
-            return Some(Ok(DirectoryEntry::new(
+            Some(Ok(DirectoryEntry::new(
                 self.parent_ino,
                 FileType::Directory,
                 false,
                 true,
                 OsStr::new("."),
-            )));
+            )))
         } else {
             let (table_id, key, value) = self.db.next(&mut self.inner)?;
             if table_id != INODE_TABLE_ID {
