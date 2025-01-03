@@ -10,9 +10,12 @@ thiserror = { version = "2.0" }
 # system
 fuser = { version = "0.15.1" }
 nix = { version = "0.29.0" }
+ctrlc = { version = "3.4" }
 
 # filesystem
-rej = { git = "https://github.com/vlad9486/rej.git", rev = "382690e", features = ["cipher"] }
+rej = { git = "https://github.com/vlad9486/rej.git", rev = "79db253", features = [
+    "cipher",
+] }
 seahash = { version = "4.1" }
 
 # crypto

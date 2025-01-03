@@ -18,13 +18,6 @@ use super::{
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-fn unwrap_time(v: fuser::TimeOrNow) -> SystemTime {
-    match v {
-        fuser::TimeOrNow::Now => SystemTime::now(),
-        fuser::TimeOrNow::SpecificTime(t) => t,
-    }
-}
-
 // ino -> data
 const DATA_TABLE_ID: u32 = 10;
 
@@ -36,18 +29,14 @@ pub struct SklepFs {
 
 impl SklepFs {
     pub fn new(
-        passphrase: &str,
+        pw: &str,
         time: u32,
         memory: u32,
         path: impl AsRef<Path>,
         uid: u32,
     ) -> Result<Self, schema::SchemaError> {
         let mut seed = [0; 64];
-        let secret = rej::Secret::Pw {
-            pw: passphrase,
-            time,
-            memory: 1 << (10 + memory),
-        };
+        let secret = rej::Secret::Pw { pw, time, memory };
         let exist = path.as_ref().exists();
         let params = if exist {
             rej::Params::Open { secret }
@@ -177,6 +166,13 @@ impl Filesystem for SklepFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        fn unwrap_time(v: fuser::TimeOrNow) -> SystemTime {
+            match v {
+                fuser::TimeOrNow::Now => SystemTime::now(),
+                fuser::TimeOrNow::SpecificTime(t) => t,
+            }
+        }
+
         let mut attr = match schema::retrieve_attr(&self.db, ino) {
             Err(err) => {
                 log::error!("lookup attr ino={ino}, error: {err}");

@@ -112,7 +112,6 @@ impl Attributes {
 
     /// Try to recognize the self from raw data
     /// The `bool` means that need to rewrite the self on the storage
-    #[allow(dead_code)]
     pub fn recognize(raw: &[u8]) -> Result<(Self, bool), StParseError> {
         use std::time::{SystemTime, Duration, UNIX_EPOCH};
 
@@ -171,7 +170,6 @@ impl Attributes {
         }
     }
 
-    #[allow(dead_code)]
     pub fn posix_attr(self, uid: u32, ino: u64) -> FileAttr {
         use std::time::{UNIX_EPOCH, Duration};
 

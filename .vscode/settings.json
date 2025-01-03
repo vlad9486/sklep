@@ -24,6 +24,7 @@
         "pamh",
         "rawio",
         "rdev",
+        "repr",
         "seahash",
         "setattr",
         "setcap",
