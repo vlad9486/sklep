@@ -9,6 +9,7 @@
         "crtime",
         "EINVAL",
         "ENOENT",
+        "ENOSPC",
         "errno",
         "fuser",
         "getattr",

@@ -28,9 +28,9 @@ where
         unsafe { slice::from_raw_parts(raw_ptr, mem::size_of::<Self>()) }
     }
 
-    // fn as_this_mut(slice: &mut [u8]) -> &mut Self {
-    //     unsafe { &mut *slice.as_mut_ptr().cast::<Self>() }
-    // }
+    fn as_this_mut(slice: &mut [u8]) -> &mut Self {
+        unsafe { &mut *slice.as_mut_ptr().cast::<Self>() }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -103,7 +103,7 @@ impl Attributes {
     pub const MAGIC: NonZeroU64 =
         unsafe { NonZeroU64::new_unchecked(u64::from_be_bytes(*b"sklep_tr")) };
 
-    fn from_older(raw: &[u8]) -> Result<Self, RecognizeError> {
+    fn from_older(raw: &mut [u8]) -> Result<&mut Self, RecognizeError> {
         // migration, create self from previous version
         // currently no older versions exist
         let _ = raw;
@@ -112,19 +112,16 @@ impl Attributes {
 
     /// Try to recognize the self from raw data
     /// The `bool` means that need to rewrite the self on the storage
-    pub fn recognize(raw: &[u8]) -> Result<(Self, bool), RecognizeError> {
+    pub fn recognize(raw: &mut [u8]) -> Result<(&mut Self, bool), RecognizeError> {
         let magic = u64::from_le_bytes(raw[..8].try_into().expect("must be big enough"));
-        let magic_old = u64::from_le_bytes(raw[12..20].try_into().expect("must be big enough"));
 
         if magic == Self::MAGIC.get() {
             let version = u16::from_le_bytes(raw[8..10].try_into().expect("must be big enough"));
             if version < Self::VERSION {
                 Self::from_older(raw).map(|s| (s, true))
             } else {
-                Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
+                Ok((Self::as_this_mut(&mut raw[..mem::size_of::<Self>()]), false))
             }
-        } else if magic_old == Self::MAGIC.get() {
-            Ok((*Self::as_this(&raw[12..][..mem::size_of::<Self>()]), true))
         } else {
             Err(RecognizeError::Unrecognized)
         }
@@ -257,7 +254,6 @@ impl DirectoryEntry {
     /// The `bool` means that need to rewrite the self on the storage
     pub fn recognize(raw: &[u8]) -> Result<(Self, bool), RecognizeError> {
         let magic = u64::from_le_bytes(raw[..8].try_into().expect("must be big enough"));
-        let magic_old = u64::from_le_bytes(raw[12..20].try_into().expect("must be big enough"));
 
         if magic == Self::MAGIC.get() {
             let version = u16::from_le_bytes(raw[8..10].try_into().expect("must be big enough"));
@@ -266,8 +262,6 @@ impl DirectoryEntry {
             } else {
                 Ok((*Self::as_this(&raw[..mem::size_of::<Self>()]), false))
             }
-        } else if magic_old == Self::MAGIC.get() {
-            Ok((*Self::as_this(&raw[12..][..mem::size_of::<Self>()]), true))
         } else {
             Err(RecognizeError::Unrecognized)
         }

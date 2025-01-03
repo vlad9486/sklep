@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, hash::Hasher, mem};
 
-use rej::{Db, DbError, DbIterator, Entry};
+use rej::{Db, DbError, DbIterator, Entry, Value};
 use seahash::SeaHasher;
 use thiserror::Error;
 
@@ -26,17 +26,7 @@ pub enum SchemaError {
 pub fn init_seed(db: &Db, seed: &mut [u8]) -> Result<[u64; 4], DbError> {
     match db.entry(SPECIAL_TABLE_ID, &[]) {
         Entry::Vacant(e) => db.write_at(e.insert()?, true, 0, &*seed)?,
-        Entry::Occupied(e) => {
-            let value = e.into_value();
-            let mut buf = [0; 8];
-            value.read(true, 0, &mut buf);
-            if u64::from_le_bytes(buf) == 32 {
-                value.read(true, 12, seed);
-                db.write_at(value, true, 0, &*seed)?;
-            } else {
-                value.read(true, 0, seed)
-            }
-        }
+        Entry::Occupied(e) => e.into_value().read(true, 0, seed),
     }
     let mut it = seed
         .chunks(8)
@@ -143,16 +133,40 @@ pub fn insert_attr(db: &Db, ino: u64, attr: &Attributes) -> Result<(), DbError> 
     Ok(())
 }
 
-pub fn retrieve_attr(db: &Db, ino: u64) -> Result<Option<Attributes>, RecognizeError> {
+pub fn retrieve_attr<'db, 'data>(
+    db: &'db Db,
+    ino: u64,
+    page: &'data mut [u8],
+) -> Option<(Value<'db>, &'data mut Attributes, &'data mut [u8])> {
     let mut ino_bytes = [0; 8];
     ino_bytes.clone_from_slice(&ino.to_le_bytes());
 
-    let Some(entry) = db.entry(ATTR_TABLE_ID, &ino_bytes).occupied() else {
-        return Ok(None);
+    let value = match db.entry(ATTR_TABLE_ID, &ino_bytes) {
+        Entry::Occupied(e) => e.into_value(),
+        Entry::Vacant(e) => {
+            log::warn!("missing attributes for ino={ino}, creating...");
+            let value = e.insert().ok()?;
+            let attr = Attributes::new(fuser::FileType::RegularFile, false, false).inc_link();
+            db.write_at(value, true, 0, attr.as_bytes()).ok()?;
+            value
+        }
     };
-    let data = entry
-        .into_value()
-        .read_to_vec(true, 0, mem::size_of::<Attributes>());
-    let (attr, _) = Attributes::recognize(&data)?;
-    Ok(Some(attr))
+    value.read(true, 0, page);
+    let (attributes, data) = page.split_at_mut(0x100);
+    match Attributes::recognize(attributes) {
+        Err(err) => {
+            log::warn!("bad attribute {ino}, error: {err}");
+            if let Err(err) = db.entry(ATTR_TABLE_ID, &ino_bytes).occupied()?.remove() {
+                log::warn!("failed to remove attribute {ino}, error: {err}");
+            }
+            None
+        }
+        Ok((attributes, true)) => {
+            log::warn!("fix attributes {attributes}");
+            db.write_at(value, true, 0, attributes.as_bytes())
+                .unwrap_or_default();
+            Some((value, attributes, data))
+        }
+        Ok((attributes, false)) => Some((value, attributes, data)),
+    }
 }

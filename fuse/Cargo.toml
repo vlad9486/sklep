@@ -13,7 +13,7 @@ nix = { version = "0.29.0" }
 ctrlc = { version = "3.4" }
 
 # filesystem
-rej = { git = "https://github.com/vlad9486/rej.git", rev = "93b1589", features = [
+rej = { git = "https://github.com/vlad9486/rej.git", rev = "fd68480", features = [
     "cipher",
 ] }
 seahash = { version = "4.1" }

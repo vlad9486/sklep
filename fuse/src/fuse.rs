@@ -18,9 +18,6 @@ use super::{
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-// ino -> data
-const DATA_TABLE_OBSOLETE_ID: u32 = 10;
-
 pub struct SklepFs {
     db: rej::Db,
     seed: [u64; 4],
@@ -92,29 +89,26 @@ impl SklepFs {
         }
 
         let mut it = self.db.entry(schema::ATTR_TABLE_ID, &[]).into_db_iter();
-        while let Some((schema::ATTR_TABLE_ID, _, v)) = self.db.next(&mut it) {
-            let (attr, rewrite) = Attributes::recognize(&v.read_to_vec(true, 0, 0x1000))?;
-            if rewrite {
-                log::warn!("fix attributes {attr}");
-            }
-            if let Err(err) = self.db.write_at(v, true, 0, attr.as_bytes()) {
-                log::error!("error during fix: {err}");
+        let mut keys = vec![];
+        while let Some((schema::ATTR_TABLE_ID, key, v)) = self.db.next(&mut it) {
+            if let Err(err) = Attributes::recognize(&mut v.read_to_vec(true, 0, 0x1000)) {
+                let ino = <[u8; 8]>::try_from(key.as_slice())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or_default();
+                log::warn!("bad attribute {ino}, error: {err}");
+                keys.push((ino, key));
             }
         }
 
-        let mut it = self.db.entry(DATA_TABLE_OBSOLETE_ID, &[]).into_db_iter();
-        let mut keys = vec![];
-        while let Some((DATA_TABLE_OBSOLETE_ID, key, _)) = self.db.next(&mut it) {
-            keys.push(key);
-        }
-        for key in keys {
-            if let rej::Entry::Occupied(entry) = self.db.entry(DATA_TABLE_OBSOLETE_ID, &key) {
-                log::warn!("remove obsolete {key:x?}");
-                if let Err(err) = entry.remove() {
-                    log::error!("error removing value from the db {err}");
-                }
-            } else {
-                log::warn!("unexpected missing {key:x?}");
+        for (ino, key) in keys {
+            if let Err(err) = self
+                .db
+                .entry(schema::ATTR_TABLE_ID, &key)
+                .occupied()
+                .expect("must exist")
+                .remove()
+            {
+                log::warn!("failed to remove attribute {ino}, error: {err}");
             }
         }
 
@@ -136,31 +130,18 @@ impl Filesystem for SklepFs {
             }
             Ok(Some(v)) => v,
         };
-        let attr = match schema::retrieve_attr(&self.db, ino) {
-            Err(err) => {
-                log::error!("lookup attr ino={ino}, error: {err}");
-                reply.error(Errno::EIO as _);
-                return;
-            }
-            Ok(None) => {
-                reply.error(Errno::ENOENT as _);
-                return;
-            }
-            Ok(Some(v)) => v,
+        let mut page = [0; 0x100];
+        match schema::retrieve_attr(&self.db, ino, &mut page) {
+            None => reply.error(Errno::ENOENT as _),
+            Some((_, attr, _)) => reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0),
         };
-        reply.entry(&TTL, &attr.posix_attr(self.uid, ino), 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match schema::retrieve_attr(&self.db, ino) {
-            Err(err) => {
-                log::error!("lookup attr ino={ino}, error: {err}");
-                reply.error(Errno::EIO as _);
-            }
-            Ok(None) => {
-                reply.error(Errno::ENOENT as _);
-            }
-            Ok(Some(attr)) => reply.attr(&TTL, &attr.posix_attr(self.uid, ino)),
+        let mut page = [0; 0x100];
+        match schema::retrieve_attr(&self.db, ino, &mut page) {
+            None => reply.error(Errno::ENOENT as _),
+            Some((_, attr, _)) => reply.attr(&TTL, &attr.posix_attr(self.uid, ino)),
         }
     }
 
@@ -189,17 +170,13 @@ impl Filesystem for SklepFs {
             }
         }
 
-        let mut attr = match schema::retrieve_attr(&self.db, ino) {
-            Err(err) => {
-                log::error!("lookup attr ino={ino}, error: {err}");
-                reply.error(Errno::EIO as _);
-                return;
-            }
-            Ok(None) => {
+        let mut page = [0; 0x100];
+        let attr = match schema::retrieve_attr(&self.db, ino, &mut page) {
+            None => {
                 reply.error(Errno::ENOENT as _);
                 return;
             }
-            Ok(Some(v)) => v,
+            Some((_, v, _)) => v,
         };
         if let Some(v) = size {
             attr.size = v;
@@ -237,12 +214,14 @@ impl Filesystem for SklepFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let key = ino.to_le_bytes();
-        let Some(entry) = self.db.entry(schema::ATTR_TABLE_ID, &key).occupied() else {
-            reply.error(Errno::ENOENT as _);
-            return;
+        let mut page = [0; 0x1000];
+        let (_, attr, data) = match schema::retrieve_attr(&self.db, ino, &mut page) {
+            None => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Some(v) => v,
         };
-        let value = entry.into_value();
 
         if offset < 0 {
             reply.error(Errno::EINVAL as _);
@@ -251,62 +230,64 @@ impl Filesystem for SklepFs {
         let offset = offset as usize;
         let size = size as usize;
 
-        let size = 6; // 6?
-        let mut data = vec![0; size];
-        // if offset > value.length() {
-        //     reply.data(&[]);
-        //     return;
-        // }
-        // let size = (offset + size).min(value.length()) - offset;
-        // value.read(offset, &mut data);
+        if offset > attr.size as usize {
+            reply.data(&[]);
+            return;
+        }
+        let size = (offset + size).min(attr.size as usize) - offset;
 
         // TODO: big value
-        value.read(true, 0x100 + offset, &mut data);
-        reply.data(&data);
+        reply.data(&data[..size]);
     }
 
-    // fn write(
-    //     &mut self,
-    //     _req: &Request<'_>,
-    //     ino: u64,
-    //     _fh: u64,
-    //     offset: i64,
-    //     data: &[u8],
-    //     _write_flags: u32,
-    //     _flags: i32,
-    //     _lock_owner: Option<u64>,
-    //     reply: ReplyWrite,
-    // ) {
-    //     let key = ino.to_le_bytes();
-    //     let value = match self.db.entry(DATA_TABLE_ID, &key) {
-    //         rej::Entry::Occupied(e) => e.into_value(),
-    //         rej::Entry::Vacant(e) => match e.insert() {
-    //             Ok(v) => v,
-    //             Err(err) => {
-    //                 log::error!("write ino={ino}, offset={offset}, error: {err}");
-    //                 reply.error(Errno::EIO as _);
-    //                 return;
-    //             }
-    //         },
-    //     };
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let mut page = [0; 0x1000];
+        let (value, attr, old) = match schema::retrieve_attr(&self.db, ino, &mut page) {
+            None => {
+                reply.error(Errno::ENOENT as _);
+                return;
+            }
+            Some(v) => v,
+        };
 
-    //     if offset < 0 {
-    //         reply.error(Errno::EINVAL as _);
-    //         return;
-    //     }
-    //     let offset = offset as usize;
-    //     if let Err(err) = self.db.write_at(value, offset, data) {
-    //         log::error!("write ino={ino}, offset={offset}, error: {err}");
-    //         reply.error(Errno::EIO as _);
-    //         return;
-    //     }
+        if offset < 0 {
+            reply.error(Errno::EINVAL as _);
+            return;
+        }
+        let offset = offset as usize;
 
-    //     if let Ok(Some(mut attr)) = schema::retrieve_attr(&self.db, ino) {
-    //         attr.size = value.length() as _;
-    //         schema::insert_attr(&self.db, ino, &attr).unwrap_or_default();
-    //     }
-    //     reply.written(data.len() as u32);
-    // }
+        let available = (old.len() + offset).min(0xf00);
+        if available <= offset {
+            reply.error(Errno::ENOSPC as _);
+            return;
+        }
+        let cut = &mut old[offset..];
+        let written = cut.len().min(data.len());
+        cut[..written].clone_from_slice(&data[..written]);
+
+        let new_edge = (offset + written) as u64;
+        if new_edge > attr.size {
+            attr.size = new_edge;
+        }
+        if let Err(err) = self.db.write_at(value, true, 0, &page) {
+            log::error!("failed to write ino: {ino}, error: {err}");
+            reply.error(Errno::EIO as _);
+            return;
+        }
+
+        reply.written(written as u32);
+    }
 
     fn flush(
         &mut self,
